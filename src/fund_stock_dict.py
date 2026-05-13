@@ -2,7 +2,13 @@
 """Fetch and parse Eastmoney fund stock holdings into a dictionary.
 
 Output format:
-    {"<fund_number>": {"<stock_name>": "<percentage>"}}
+    {
+      "<fund_number>": {
+        "fund_name": "<name>",
+        "fund_type": "<type>",
+        "holdings": {"<stock_name>": "<percentage>"}
+      }
+    }
 
 Example:
     python3 src/fund_stock_dict.py 017731
@@ -12,11 +18,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import pathlib
 import re
 import sys
-from typing import Dict
+from typing import Any, Dict
 import urllib.error
 
 try:
@@ -25,6 +32,10 @@ try:
 except ImportError:
     from fetch_fund_html import DEFAULT_TIMEOUT, build_url, fetch_html
     from parse_fund_stocks import extract_stock_rows
+
+
+PLACEHOLDER_FUND_NAME = "N/A"
+PLACEHOLDER_FUND_TYPE = "N/A"
 
 
 def normalize_fund_number(value: str | int) -> str:
@@ -39,22 +50,90 @@ def normalize_fund_number(value: str | int) -> str:
     return code.zfill(6)
 
 
-def get_fund_stock_dict(fund_number: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Dict[str, str]]:
-    """Fetch fund page HTML and return stock holding percentages as a dict.
+def _build_placeholder_result(code: str) -> Dict[str, Dict[str, Any]]:
+    return {
+        code: {
+            "fund_name": PLACEHOLDER_FUND_NAME,
+            "fund_type": PLACEHOLDER_FUND_TYPE,
+            "holdings": {},
+        }
+    }
+
+
+def _extract_fund_name(content: str, code: str) -> str:
+    name_match = re.search(
+        r'class=["\']funCur-FundName["\']>\s*([^<]+?)\s*</span>',
+        content,
+        flags=re.IGNORECASE,
+    )
+    if name_match:
+        return html.unescape(name_match.group(1)).strip()
+
+    title_match = re.search(
+        rf"<title>\s*(.*?)\({re.escape(code)}\)基金净值",
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if title_match:
+        return html.unescape(title_match.group(1)).strip()
+
+    return ""
+
+
+def _extract_fund_type(content: str) -> str:
+    type_match = re.search(
+        r"类型：\s*(?:<a[^>]*>)?\s*([^<|]+?)\s*(?:</a>)?(?:\s|&nbsp;)*(?:\||</td>)",
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not type_match:
+        return ""
+
+    return html.unescape(type_match.group(1)).replace("\xa0", " ").strip()
+
+
+def get_fund_stock_dict(fund_number: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Dict[str, Any]]:
+    """Fetch fund page HTML and return fund summary + holdings as a dict.
 
     Returns:
-        {"<fund_number>": {"<stock_name>": "<percentage>"}}
+        {
+            "<fund_number>": {
+                "fund_name": "<name>",
+                "fund_type": "<type>",
+                "holdings": {"<stock_name>": "<percentage>"}
+            }
+        }
     """
     code = normalize_fund_number(fund_number)
 
     url = build_url(code)
-    html_bytes = fetch_html(url, timeout)
+    try:
+        html_bytes = fetch_html(url, timeout)
+    except urllib.error.HTTPError as exc:
+        # Invalid fund pages can respond with HTTP errors. Return placeholder instead.
+        if exc.code in (400, 404):
+            return _build_placeholder_result(code)
+        raise
+
     content = html_bytes.decode("utf-8", errors="ignore")
 
-    rows = extract_stock_rows(content)
-    stock_map = {stock_name: percentage for stock_name, percentage, _change in rows}
+    try:
+        rows = extract_stock_rows(content)
+    except ValueError:
+        # Missing holdings section usually means invalid/non-standard fund page.
+        return _build_placeholder_result(code)
 
-    return {code: stock_map}
+    stock_map = {stock_name: percentage for stock_name, percentage, _change in rows}
+    fund_name = _extract_fund_name(content, code)
+    fund_type = _extract_fund_type(content)
+
+    return {
+        code: {
+            "fund_name": fund_name or PLACEHOLDER_FUND_NAME,
+            "fund_type": fund_type or PLACEHOLDER_FUND_TYPE,
+            "holdings": stock_map,
+        }
+    }
 
 
 def _extract_codes_from_text(content: str) -> list[str]:
@@ -116,7 +195,7 @@ def load_fund_numbers(file_path: str | pathlib.Path) -> list[str]:
 
 def get_multiple_fund_stock_dict(
     file_path: str | pathlib.Path, timeout: int = DEFAULT_TIMEOUT
-) -> Dict[str, Dict[str, str]]:
+) -> Dict[str, Dict[str, Any]]:
     """Fetch and parse stock holdings for multiple fund numbers from a file."""
     fund_numbers = load_fund_numbers(file_path)
     result: Dict[str, Dict[str, str]] = {}
